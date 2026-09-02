@@ -33,6 +33,7 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
@@ -291,6 +292,86 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
     provider
+}
+
+enum ExpectedLocalCompactionResult {
+    Success,
+    Failure(&'static str),
+}
+
+struct LocalCompactionScenario {
+    attempts: Vec<String>,
+    stream_max_retries: u64,
+    expected_result: ExpectedLocalCompactionResult,
+}
+
+struct LocalCompactionRun {
+    requests: Vec<responses::ResponsesRequest>,
+    rollout_items: Vec<RolloutItem>,
+}
+
+async fn run_local_compaction_scenario(
+    scenario: LocalCompactionScenario,
+) -> Result<LocalCompactionRun> {
+    let server = start_mock_server().await;
+    let mut responses = vec![sse(vec![
+        ev_assistant_message("initial-message", FIRST_REPLY),
+        ev_completed("initial-response"),
+    ])];
+    responses.extend(scenario.attempts);
+    responses.push(sse(vec![ev_completed("follow-up-response")]));
+    let response_mock = mount_sse_sequence(&server, responses).await;
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(scenario.stream_max_retries);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    test.submit_text_turn("start").await?;
+    test.codex.submit(Op::Compact).await?;
+    if let ExpectedLocalCompactionResult::Failure(expected) = scenario.expected_result {
+        let error_message = wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::Error(error) => Some(error.message.clone()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            error_message.contains(expected),
+            "unexpected compact error: {error_message}"
+        );
+    }
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("follow up").await?;
+    test.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let rollout_items = fs::read_to_string(rollout_path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|line| line.item)
+        .collect();
+    Ok(LocalCompactionRun {
+        requests: response_mock.requests(),
+        rollout_items,
+    })
 }
 
 fn openai_model_provider(server: &MockServer) -> ModelProviderInfo {
@@ -986,6 +1067,183 @@ async fn manual_compact_uses_custom_prompt() {
             "summarization prompt should not appear if compaction omits a prompt"
         );
     }
+}
+
+#[derive(Clone, Copy)]
+enum NonSummaryCompactionOutput {
+    Reasoning,
+    ToolCall,
+    Citation,
+    Commentary,
+}
+
+#[test_case::test_case(NonSummaryCompactionOutput::Reasoning; "reasoning only")]
+#[test_case::test_case(NonSummaryCompactionOutput::ToolCall; "tool call only")]
+#[test_case::test_case(NonSummaryCompactionOutput::Citation; "citation only")]
+#[test_case::test_case(NonSummaryCompactionOutput::Commentary; "commentary only")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compact_without_visible_final_summary_preserves_existing_history(
+    compact_output: NonSummaryCompactionOutput,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let output_item = match compact_output {
+        NonSummaryCompactionOutput::Reasoning => {
+            ev_reasoning_item("reasoning-only", &["COMPACTION_REASONING_ONLY"], &[])
+        }
+        NonSummaryCompactionOutput::ToolCall => {
+            ev_function_call("compaction-call", DUMMY_FUNCTION_NAME, "{}")
+        }
+        NonSummaryCompactionOutput::Citation => ev_assistant_message(
+            "citation-only",
+            "<oai-mem-citation>COMPACTION_CITATION_ONLY</oai-mem-citation>",
+        ),
+        NonSummaryCompactionOutput::Commentary => {
+            let mut item = ev_assistant_message("commentary-only", "COMPACTION_COMMENTARY_ONLY");
+            item["item"]["phase"] = json!("commentary");
+            item
+        }
+    };
+    let run = run_local_compaction_scenario(LocalCompactionScenario {
+        attempts: vec![sse(vec![
+            output_item,
+            ev_completed("invalid-compact-response"),
+        ])],
+        stream_max_retries: 0,
+        expected_result: ExpectedLocalCompactionResult::Failure(
+            "local compaction response.completed contained no visible final assistant summary",
+        ),
+    })
+    .await?;
+    assert_eq!(run.requests.len(), 3);
+    let follow_up_input = run.requests[2].input();
+    assert!(follow_up_input.iter().any(|item| {
+        item.to_string().contains("start") && item.to_string().contains(FIRST_REPLY)
+    }));
+    assert!(
+        !follow_up_input
+            .iter()
+            .any(|item| item.to_string().contains(SUMMARY_PREFIX))
+    );
+
+    assert!(
+        !run.rollout_items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::Compacted(_)))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compact_retry_binds_summary_and_response_id_to_successful_attempt() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let failed_attempt_summary = "FAILED_ATTEMPT_SUMMARY";
+    let successful_attempt_summary = "SUCCESSFUL_ATTEMPT_SUMMARY";
+    let run = run_local_compaction_scenario(LocalCompactionScenario {
+        attempts: vec![
+            sse(vec![ev_assistant_message(
+                "failed-attempt-message",
+                failed_attempt_summary,
+            )]),
+            sse(vec![
+                ev_assistant_message("successful-attempt-message", successful_attempt_summary),
+                ev_completed("successful-compact-response"),
+            ]),
+        ],
+        stream_max_retries: 1,
+        expected_result: ExpectedLocalCompactionResult::Success,
+    })
+    .await?;
+    assert_eq!(run.requests.len(), 4);
+    let follow_up_input = run.requests[3].input();
+    assert!(follow_up_input.iter().any(|item| {
+        item.to_string()
+            .contains(&summary_with_prefix(successful_attempt_summary))
+    }));
+
+    let compacted_items = run
+        .rollout_items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [compacted] = compacted_items.as_slice() else {
+        panic!("expected one compacted checkpoint, got {compacted_items:?}");
+    };
+    assert_eq!(
+        (
+            compacted.message.as_str(),
+            compacted.compaction_response_id.as_deref()
+        ),
+        (
+            summary_with_prefix(successful_attempt_summary).as_str(),
+            Some("successful-compact-response")
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compact_uses_last_visible_final_assistant_output_item() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut trailing_commentary = ev_assistant_message("commentary", "TRAILING_COMMENTARY");
+    trailing_commentary["item"]["phase"] = json!("commentary");
+    let run = run_local_compaction_scenario(LocalCompactionScenario {
+        attempts: vec![sse(vec![
+            ev_assistant_message("earlier-summary", "EARLIER_SUMMARY"),
+            ev_assistant_message("latest-summary", "LATEST_FINAL_SUMMARY"),
+            trailing_commentary,
+            ev_completed("compact-response"),
+        ])],
+        stream_max_retries: 2,
+        expected_result: ExpectedLocalCompactionResult::Success,
+    })
+    .await?;
+
+    let follow_up_input = run.requests[2].input();
+    assert!(follow_up_input.iter().any(|item| {
+        item.to_string()
+            .contains(&summary_with_prefix("LATEST_FINAL_SUMMARY"))
+    }));
+    assert!(!follow_up_input.iter().any(|item| {
+        let item = item.to_string();
+        item.contains("EARLIER_SUMMARY") || item.contains("TRAILING_COMMENTARY")
+    }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compact_caps_complete_prefixed_summary() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let long_summary = format!("retained start {}retained end", "middle ".repeat(20_000));
+    let run = run_local_compaction_scenario(LocalCompactionScenario {
+        attempts: vec![sse(vec![
+            ev_assistant_message("compact-message", &long_summary),
+            ev_completed("compact-response"),
+        ])],
+        stream_max_retries: 2,
+        expected_result: ExpectedLocalCompactionResult::Success,
+    })
+    .await?;
+
+    let prefix = format!("{SUMMARY_PREFIX}\n");
+    let summaries = run.requests[2]
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    let [summary] = summaries.as_slice() else {
+        panic!("expected one prefixed summary, got {summaries:?}");
+    };
+    assert!(approx_token_count(summary) <= 4096);
+    assert!(summary.starts_with(&prefix));
+    assert!(summary.ends_with("retained end"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
