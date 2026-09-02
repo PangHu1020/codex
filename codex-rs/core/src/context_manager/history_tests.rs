@@ -1,5 +1,6 @@
 use super::*;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
+use crate::context::CompactionSummary;
 use crate::context::UserInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
@@ -281,6 +282,22 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
     }
 }
 
+fn compaction_summary(text: &str) -> ResponseItem {
+    ContextualUserFragment::into(CompactionSummary::new(text))
+}
+
+fn legacy_compaction_summary(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: format!("{}\n{text}", codex_prompts::SUMMARY_PREFIX),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
 fn developer_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -422,6 +439,16 @@ fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
 }
 
 #[test]
+fn compaction_summary_is_not_a_reasoning_boundary() {
+    let history = create_history_with_items(vec![
+        reasoning_with_encrypted_content(/*len*/ 800),
+        compaction_summary("checkpoint"),
+    ]);
+
+    assert_eq!(history.get_non_last_reasoning_items_tokens(), 0);
+}
+
+#[test]
 fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
     let history = create_history_with_items(vec![
         reasoning_with_encrypted_content(/*len*/ 900),
@@ -474,6 +501,35 @@ fn inter_agent_assistant_messages_are_turn_boundaries() {
     let item = inter_agent_assistant_msg("continue");
 
     assert!(is_user_turn_boundary(&item));
+}
+
+#[test]
+fn compaction_summaries_are_not_user_turn_boundaries() {
+    let mut prefixed_user_message = user_input_text_msg(&format!(
+        "{}\nreal user text",
+        codex_prompts::SUMMARY_PREFIX
+    ));
+    let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough: Some(metadata),
+        ..
+    } = &mut prefixed_user_message
+    else {
+        panic!("expected user message metadata");
+    };
+    metadata.content_item_kinds = Some(vec![ContentItemKind("user.text".to_string())]);
+
+    assert_eq!(
+        [
+            compaction_summary("metadata summary"),
+            legacy_compaction_summary("legacy summary"),
+            prefixed_user_message,
+            user_input_text_msg("## Objective\nreal user text"),
+        ]
+        .iter()
+        .map(is_user_turn_boundary)
+        .collect::<Vec<_>>(),
+        vec![false, false, true, true]
+    );
 }
 
 #[test]
@@ -623,6 +679,25 @@ fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_t
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
     assert_eq!(raw_items(&history), vec![first_turn, first_reply]);
+}
+
+#[test]
+fn drop_last_n_user_turns_does_not_count_compaction_summaries() {
+    let first_turn = user_input_text_msg("first");
+    let first_reply = assistant_msg("first reply");
+    let summary = compaction_summary("checkpoint");
+    let second_turn = user_input_text_msg("second");
+    let mut history = create_history_with_items(vec![
+        first_turn.clone(),
+        first_reply.clone(),
+        summary.clone(),
+        second_turn,
+        assistant_msg("second reply"),
+    ]);
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(raw_items(&history), vec![first_turn, first_reply, summary]);
 }
 
 #[test]

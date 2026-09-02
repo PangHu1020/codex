@@ -6,6 +6,7 @@ use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
+use crate::context::is_compaction_summary_item;
 use crate::context::world_state::WorldState;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -551,12 +552,12 @@ fn compacted_user_message(
     item: &ResponseItem,
     harness_metadata: Option<CodexHarnessMetadata>,
 ) -> Option<CompactedUserMessage> {
+    if is_compaction_summary_item(item) {
+        return None;
+    }
     let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
         return None;
     };
-    if is_summary_message(&user.message()) {
-        return None;
-    }
     Some(CompactedUserMessage {
         message: user.message(),
         internal_chat_message_metadata_passthrough: match item {
@@ -568,10 +569,6 @@ fn compacted_user_message(
         },
         harness_metadata,
     })
-}
-
-pub(crate) fn is_summary_message(message: &str) -> bool {
-    message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
 /// Inserts canonical initial context into compacted replacement history at the
@@ -601,7 +598,7 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
             last_real_user_index = Some(i);
             break;
         }
-        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(&item.item)
+        let Some(TurnItem::UserMessage(_)) = crate::event_mapping::parse_turn_item(&item.item)
         else {
             continue;
         };
@@ -609,7 +606,7 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
         // the last real user message (preferred insertion point) and the last
         // user-message-like item (fallback summary insertion point).
         last_user_or_summary_index.get_or_insert(i);
-        if !is_summary_message(&user.message()) {
+        if !is_compaction_summary_item(&item.item) {
             last_real_user_index = Some(i);
             break;
         }

@@ -137,3 +137,7 @@ pub(super) async fn maybe_record_current_time_reminder(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "time_reminder_tests.rs"]
+mod tests;
