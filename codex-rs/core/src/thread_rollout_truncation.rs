@@ -3,6 +3,7 @@
 //! In core, "user turns" are detected by scanning `ResponseItem::Message` items and
 //! interpreting them via `event_mapping::parse_turn_item(...)`.
 
+use crate::context::is_compaction_summary_item;
 use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
 use codex_app_server_protocol::TurnStatus;
@@ -42,6 +43,7 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
         match item {
             RolloutItem::ResponseItem(item)
                 if matches!(&item.item, ResponseItem::Message { .. })
+                    && !is_compaction_summary_item(&item.item)
                     && matches!(
                         event_mapping::parse_turn_item(&item.item),
                         Some(TurnItem::UserMessage(_))
@@ -279,10 +281,11 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
 }
 
 fn is_real_user_message_boundary(item: &ResponseItem) -> bool {
-    matches!(
-        event_mapping::parse_turn_item(item),
-        Some(TurnItem::UserMessage(_))
-    )
+    !is_compaction_summary_item(item)
+        && matches!(
+            event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(_))
+        )
 }
 
 fn is_trigger_turn_boundary(item: &ResponseItem) -> bool {

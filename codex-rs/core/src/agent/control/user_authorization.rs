@@ -2,8 +2,8 @@ use super::AgentControl;
 use crate::codex_thread::GuardianAuthorizationVersion;
 use crate::codex_thread::GuardianRootMessage;
 use crate::codex_thread::GuardianRootSnapshot;
-use crate::compact::is_summary_message;
 use crate::context::GuardianReviewEvidence;
+use crate::context::is_compaction_summary_item;
 use crate::event_mapping::parse_turn_item;
 use crate::guardian::guardian_truncate_text;
 use codex_protocol::AgentPath;
@@ -43,9 +43,9 @@ impl AgentControl {
         let mut messages = root_history
             .raw_items()
             .filter_map(|item| match (parse_turn_item(item), item) {
-                (Some(TurnItem::UserMessage(message)), _) => {
+                (Some(TurnItem::UserMessage(message)), item) => {
                     let message = message.message();
-                    (!is_summary_message(&message)
+                    (!is_compaction_summary_item(item)
                         && !message.trim_start().starts_with("<user_action>"))
                     .then(|| {
                         latest_user_turn_id = item.turn_id().map(str::to_owned);

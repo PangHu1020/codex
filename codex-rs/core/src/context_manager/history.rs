@@ -3,6 +3,7 @@
 
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
+use crate::context::is_compaction_summary_item;
 use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
@@ -944,6 +945,9 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
+    if is_compaction_summary_item(item) {
+        return false;
+    }
     if matches!(item, ResponseItem::AgentMessage { .. }) {
         return true;
     }

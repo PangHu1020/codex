@@ -1,4 +1,6 @@
 use super::*;
+use crate::context::CompactionSummary;
+use crate::context::ContextualUserFragment;
 use crate::session::tests::build_world_state_from_turn_context;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::AgentPath;
@@ -28,6 +30,10 @@ fn user_msg(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn compaction_summary(text: &str) -> ResponseItem {
+    ContextualUserFragment::into(CompactionSummary::new(text))
 }
 
 fn assistant_msg(text: &str) -> ResponseItem {
@@ -310,6 +316,27 @@ fn truncates_rollout_from_start_before_nth_user_only() {
     assert_eq!(
         serde_json::to_value(&truncated2).unwrap(),
         serde_json::to_value(&rollout).unwrap()
+    );
+}
+
+#[test]
+fn rollout_user_and_fork_positions_ignore_compaction_summaries() {
+    let rollout = vec![
+        response_item(user_msg("u1")),
+        response_item(assistant_msg("a1")),
+        response_item(compaction_summary("checkpoint")),
+        response_item(user_msg("u2")),
+    ];
+
+    assert_eq!(user_message_positions_in_rollout(&rollout), vec![0, 3]);
+    assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![0, 3]);
+    assert_eq!(
+        serde_json::to_value(truncate_rollout_to_last_n_fork_turns(
+            rollout.clone(),
+            /*n_from_end*/ 1,
+        ))
+        .unwrap(),
+        serde_json::to_value(&rollout[3..]).unwrap()
     );
 }
 

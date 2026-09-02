@@ -596,6 +596,67 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_after_compaction_and_resume_drops_the_real_user_turn() -> Result<()> {
+    if network_disabled() {
+        println!("Skipping test because network is disabled in this sandbox");
+        return Ok(());
+    }
+
+    let server = MockServer::start().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", FIRST_REPLY),
+                ev_completed("r1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", SUMMARY_TEXT),
+                ev_completed("r2"),
+            ]),
+            sse(vec![ev_completed("r3")]),
+        ],
+    )
+    .await;
+    let (_home, config, manager, conversation) =
+        start_test_conversation(&server, /*model*/ None).await;
+
+    user_turn(&conversation, "hello world").await;
+    compact_conversation(&conversation).await;
+    conversation
+        .submit(Op::ThreadRollback { num_turns: 1 })
+        .await
+        .expect("submit thread rollback");
+    let rollback_event = wait_for_event(&conversation, |event| {
+        matches!(event, EventMsg::ThreadRolledBack(_))
+    })
+    .await;
+    let EventMsg::ThreadRolledBack(rollback_event) = rollback_event else {
+        panic!("expected thread rolled back event");
+    };
+    assert_eq!(rollback_event.num_turns, 1);
+
+    let rollout_path = fetch_conversation_path(&conversation);
+    shutdown_conversation(&conversation).await;
+    let resumed = resume_conversation(&manager, &config, rollout_path).await;
+    user_turn(&resumed, AFTER_ROLLBACK).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[2].body_contains_text("hello world"));
+    assert!(!requests[2].body_contains_text(SUMMARY_TEXT));
+    assert_eq!(
+        requests[2]
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some(AFTER_ROLLBACK)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: rolling back a turn that introduced persistent pre-thread settings
 /// diffs should trim those context updates so the next request includes them
 /// only once.

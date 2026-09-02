@@ -64,6 +64,10 @@ fn user_message(text: &str) -> ResponseItem {
     }
 }
 
+fn compaction_summary(text: &str) -> ResponseItem {
+    ContextualUserFragment::into(CompactionSummary::new(text))
+}
+
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
         message: text.to_string(),
@@ -214,6 +218,20 @@ fn collect_user_messages_filters_legacy_warnings() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("real user message")], collected);
+}
+
+#[test]
+fn collect_user_messages_filters_compaction_summaries() {
+    let items = vec![
+        compaction_summary("metadata summary"),
+        user_message(&format!("{SUMMARY_PREFIX}\nlegacy summary")),
+        user_message("real user message"),
+    ];
+
+    assert_eq!(
+        collect_user_messages(&items),
+        vec![compacted_user_message("real user message")]
+    );
 }
 
 #[test]
@@ -645,6 +663,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         }],
         internal_chat_message_metadata_passthrough: None,
     };
+    let summary = compaction_summary("metadata summary");
     let compacted_history = vec![
         ResponseItem::Message {
             id: None,
@@ -665,15 +684,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             internal_chat_message_metadata_passthrough: None,
         },
         agent_completion.clone(),
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        summary.clone(),
     ];
     let initial_context = vec![ResponseItem::Message {
         id: None,
@@ -718,15 +729,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             internal_chat_message_metadata_passthrough: None,
         },
         agent_completion,
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        summary,
     ];
     assert_eq!(refreshed, expected);
 }
